@@ -1,0 +1,18 @@
+# 機密：絕對不要進版控
+.env
+*.key
+
+# 資料檔（量大、可重抓，不進版控）
+data/raw/
+data/processed/
+*.parquet
+*.h5
+*.hdf5
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/

@@ -1,0 +1,5 @@
+tejapi
+pandas
+numpy
+pyarrow
+requests
