@@ -21,9 +21,13 @@ import pandas as pd
 from config import DATA_PROCESSED
 from mine_dfs import build_monthly_base, generate, TRAIN_END
 
-# 選用因子（皆為「越大越好」方向；neg_vol 已轉正向）
-FACTORS = ["gp_to_px", "eps_to_px", "op_to_rev", "g_eps_12",
-           "neg_vol_63", "dist_high"]
+# 選用因子（皆為「越大越好」方向）——2012–2026、跨多空頭測試後挑出的穩健、
+# 且分屬不同維度(價值/現金流品質/品質/低波動/動能/成長)的因子，正交化後不重複。
+FACTORS = ["gp_to_px", "fcf_yield", "bp",          # 價值：獲利/現金流/淨值
+           "quality_score", "neg_accruals",         # 品質
+           "neg_vol_63",                             # 低波動
+           "dist_high",                              # 動能
+           "g_eps_12"]                               # 成長
 # ---- 鎖定的最終策略版本（依集中度/加權雙期一致性檢驗選出）----
 TOP_Q = 0.10            # 各產業內做多前 10%（甜蜜點：測試 Sharpe 最高、夠分散）
 COST = 0.004            # 單次換手成本(費+稅+滑點)近似，套用於換手比例
@@ -31,11 +35,16 @@ WEIGHTING = "momentum"  # 動能加權(以 dist_high 排名)：訓練/測試兩�
 ANN = 12
 
 
-def zscore_within_group(df, cols):
+def zscore_within_group(df, cols, min_cov=0.6):
+    """產業內中性化 z-score。覆蓋率保險：某 (月×產業) 內若該因子有效資料
+    不足 min_cov，就把該組整欄設為中性(NaN→0)，避免少數股票的極端值主導，
+    也確保產業專屬科目不會被硬套到資料稀疏的產業。"""
     out = df.copy()
     for c in cols:
         g = out.groupby(["ym", "group"])[c]
-        out[c] = ((out[c] - g.transform("mean")) / g.transform("std"))
+        z = (out[c] - g.transform("mean")) / g.transform("std")
+        cov = g.transform(lambda s: s.notna().mean())
+        out[c] = z.where(cov >= min_cov)
     out[cols] = out[cols].fillna(0.0)
     return out
 
@@ -85,7 +94,10 @@ def portfolio_returns(df, top_q=TOP_Q, weighting=WEIGHTING):
         S = pd.concat(shorts)
 
         if weighting == "momentum" and "dist_high" in L.columns:
-            wl = L["dist_high"].rank()
+            wl = L["dist_high"].rank()              # 動能加權：動能強者多配
+            wl = wl / wl.sum()
+        elif weighting == "score":
+            wl = L["score"].rank()                  # 分數加權：模型越看好者多配(信心加權)
             wl = wl / wl.sum()
         else:
             wl = pd.Series(1.0 / len(L), index=L.index)
@@ -110,6 +122,44 @@ def portfolio_returns(df, top_q=TOP_Q, weighting=WEIGHTING):
         "nhold": pd.Series(nhold),
     }).sort_index()
     return out
+
+
+def load_benchmarks():
+    """讀外部基準（0050、大盤/櫃買報酬指數），回傳以 ym(Period) 為索引的 DataFrame。"""
+    p = DATA_PROCESSED.parent / "raw" / "benchmarks.parquet"
+    if not p.exists():
+        return None
+    bm = pd.read_parquet(p)
+    bm["ym"] = pd.PeriodIndex(bm["ym"], freq="M")
+    return bm.set_index("ym")
+
+
+def benchmark_compare(rets, bench_df, strat="long"):
+    """比較策略 vs 各基準：CAGR、Sharpe、MaxDD，以及策略相對該基準的超額與 t 值。"""
+    cols = {"全池等權": rets["benchmark"]}
+    if bench_df is not None:
+        for c in bench_df.columns:
+            cols[c] = bench_df[c].reindex(rets.index)
+
+    def block(name, mask):
+        print(f"\n--- 超額/回撤比較：{name} ---")
+        print(f"{'基準':>14} {'基準CAGR':>9} {'基準SR':>6} {'基準MaxDD':>9} | "
+              f"{'策略超額':>8} {'超額t':>6}")
+        s = rets.loc[mask, strat]
+        for bname, bser in cols.items():
+            b = bser.loc[mask].dropna()
+            common = s.dropna().index.intersection(b.index)
+            if len(common) < 6:
+                continue
+            pf = perf(b.loc[common])
+            a = (s.loc[common] - b.loc[common])
+            t = a.mean() / (a.std() / np.sqrt(len(a))) if a.std() > 0 else np.nan
+            ann_ex = a.mean() * ANN
+            print(f"{bname:>14} {pf['CAGR']:>9.2%} {pf['Sharpe']:>6.2f} "
+                  f"{pf['MaxDD']:>9.2%} | {ann_ex:>8.2%} {t:>6.2f}")
+
+    block("全期", rets.index == rets.index)
+    block("測試期 (>2023)", rets.index > TRAIN_END)
 
 
 def perf(r):
@@ -213,12 +263,12 @@ def main():
     print(f"{'集中度':>6} {'加權':>8} {'持股~':>5} | {'訓練CAGR':>8} {'訓練SR':>6} {'訓練t':>6} | "
           f"{'測試CAGR':>8} {'測試SR':>6} {'測試t':>6} | {'換手':>5}")
     for q in [0.05, 0.10]:
-        for w in ["equal", "momentum"]:
+        for w in ["equal", "momentum", "score"]:
             r = portfolio_returns(df, top_q=q, weighting=w)
             tr, te = r[r.index <= TRAIN_END], r[r.index > TRAIN_END]
             c1, s1, t1 = leg_stats(tr)
             c2, s2, t2 = leg_stats(te)
-            wlab = "等權" if w == "equal" else "動能"
+            wlab = {"equal": "等權", "momentum": "動能", "score": "分數"}[w]
             print(f"{q:>6.0%} {wlab:>8} {int(r['nhold'].mean()):>5d} | "
                   f"{c1:>8.2%} {s1:>6.2f} {t1:>6.2f} | "
                   f"{c2:>8.2%} {s2:>6.2f} {t2:>6.2f} | {r['turnover'].mean():>5.0%}")
@@ -230,6 +280,14 @@ def main():
     print("\n############ 鎖定策略：前10% + 動能加權 ############")
     locked = portfolio_returns(df, top_q=TOP_Q, weighting=WEIGHTING)
     report(locked)
+
+    # 對照外部市場基準（0050、大盤/櫃買報酬指數）
+    bench_df = load_benchmarks()
+    if bench_df is not None:
+        benchmark_compare(locked, bench_df, strat="long")
+    else:
+        print("\n（未找到 data/raw/benchmarks.parquet，先跑 fetch_benchmarks.py 可加入 0050/大盤基準）")
+
     locked.to_csv(DATA_PROCESSED / "backtest_returns.csv")
     print("\n鎖定版月報酬已存：data/processed/backtest_returns.csv")
 
