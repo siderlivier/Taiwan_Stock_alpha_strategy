@@ -38,8 +38,8 @@ if not TEJ_API_KEY:
     )
 
 # ---- 回測 / 抓取範圍 ----
-START_DATE = "2018-01-01"   # 受 TEJ 試用財報限制（資料自 2018 起）
-END_DATE = "2026-06-19"
+START_DATE = "2012-01-01"   # 擴大樣本：FinMind 價格回1994、財報1990、資產負債表自2012
+END_DATE = "2026-06-25"
 
 # ---- 目標產業 ----
 # FinMind TaiwanStockInfo 的 industry_category 在上市/上櫃命名略有差異，

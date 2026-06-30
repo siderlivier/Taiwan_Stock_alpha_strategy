@@ -76,6 +76,18 @@ def get_financial_statement(stock_id: str, start: str, end: str) -> pd.DataFrame
                 {"data_id": stock_id, "start_date": start, "end_date": end})
 
 
+def get_balance_sheet(stock_id: str, start: str, end: str) -> pd.DataFrame:
+    """資產負債表(long)：date(期末)/stock_id/type/value/origin_name；資料自 2011-12 起。"""
+    return _get("TaiwanStockBalanceSheet",
+                {"data_id": stock_id, "start_date": start, "end_date": end})
+
+
+def get_cashflow(stock_id: str, start: str, end: str) -> pd.DataFrame:
+    """現金流量表(long)：date(期末)/stock_id/type/value/origin_name；資料自 2008-06 起。"""
+    return _get("TaiwanStockCashFlowsStatement",
+                {"data_id": stock_id, "start_date": start, "end_date": end})
+
+
 def back_adjust(price: pd.DataFrame, dividend: pd.DataFrame) -> pd.DataFrame:
     """
     後復權（back-adjust）：用除權息「參考價 / 除權息前一日收盤」當每次事件的調整係數，

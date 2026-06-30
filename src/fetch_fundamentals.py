@@ -16,7 +16,8 @@ import argparse
 import pandas as pd
 
 from config import DATA_RAW, START_DATE, END_DATE
-from finmind_client import get_month_revenue, get_financial_statement, FinMindError
+from finmind_client import (get_month_revenue, get_financial_statement,
+                            get_balance_sheet, get_cashflow, FinMindError)
 
 SLEEP_SEC = 0.6
 
@@ -68,9 +69,11 @@ def main(limit=None):
 
     fetch("revenue", get_month_revenue, ids)
     fetch("financials", get_financial_statement, ids)
-    merge("revenue")
-    merge("financials")
-    print("\n完成。下一步：發布日對齊（月營收加 lag、財報用法定期限近似）。")
+    fetch("balance", get_balance_sheet, ids)
+    fetch("cashflow", get_cashflow, ids)
+    for k in ["revenue", "financials", "balance", "cashflow"]:
+        merge(k)
+    print("\n完成。下一步：發布日對齊（月營收加 lag、財報/資負/現金流用法定期限近似）。")
 
 
 if __name__ == "__main__":

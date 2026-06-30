@@ -93,14 +93,16 @@ def portfolio_returns(df, top_q=TOP_Q, weighting=WEIGHTING):
         L = pd.concat(longs)
         S = pd.concat(shorts)
 
-        if weighting == "momentum" and "dist_high" in L.columns:
-            wl = L["dist_high"].rank()              # 動能加權：動能強者多配
-            wl = wl / wl.sum()
-        elif weighting == "score":
-            wl = L["score"].rank()                  # 分數加權：模型越看好者多配(信心加權)
-            wl = wl / wl.sum()
-        else:
+        if weighting == "equal":
             wl = pd.Series(1.0 / len(L), index=L.index)
+        else:
+            # weighting 可為 "momentum"(=dist_high)、"score"(綜合分數)，或任一因子欄名
+            wcol = "dist_high" if weighting == "momentum" else weighting
+            if wcol in L.columns and L[wcol].notna().any():
+                wl = L[wcol].rank()                 # 以該因子排名配重(值越大、權重越高)
+                wl = wl / wl.sum()
+            else:
+                wl = pd.Series(1.0 / len(L), index=L.index)
 
         long_ret = float((L["fwd_ret_1m"] * wl).sum())
         short_ret = float(S["fwd_ret_1m"].mean())
@@ -275,6 +277,19 @@ def main():
             r.to_csv(DATA_PROCESSED / f"backtest_q{int(q*100)}_{w}.csv")
     print("\n各組合月報酬已存：data/processed/backtest_q{5,10}_{equal,momentum}.csv")
     print("判讀：動能加權若在訓練、測試兩期都讓 CAGR/Sharpe 提升才採用；只在單期變好就是雜訊。")
+
+    # ===== 單因子配重比較（前10%，分別以每個因子當唯一配重依據）=====
+    print("\n===== 單因子配重比較（前10%；各以單一因子排名配重）=====")
+    print(f"{'配重因子':>14} | {'訓CAGR':>8} {'訓SR':>6} {'訓t':>6} | "
+          f"{'測CAGR':>8} {'測SR':>6} {'測t':>6}")
+    for w in ["equal"] + facs:
+        r = portfolio_returns(df, top_q=0.10, weighting=w)
+        tr, te = r[r.index <= TRAIN_END], r[r.index > TRAIN_END]
+        c1, s1, t1 = leg_stats(tr)
+        c2, s2, t2 = leg_stats(te)
+        lab = "等權" if w == "equal" else w
+        print(f"{lab:>14} | {c1:>8.2%} {s1:>6.2f} {t1:>6.2f} | "
+              f"{c2:>8.2%} {s2:>6.2f} {t2:>6.2f}")
 
     # ===== 鎖定版本完整報告：10% + 動能加權 =====
     print("\n############ 鎖定策略：前10% + 動能加權 ############")

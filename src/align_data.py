@@ -29,6 +29,11 @@ def load(name):
     return pd.read_parquet(p)
 
 
+def load_optional(name):
+    p = DATA_RAW / name
+    return pd.read_parquet(p) if p.exists() else None
+
+
 def build_price_base(prices, universe):
     """每日還原價基底 + 日報酬，掛上產業別。"""
     df = prices.copy()
@@ -36,10 +41,10 @@ def build_price_base(prices, universe):
     df = df.sort_values(["stock_id", "date"]).reset_index(drop=True)
     # 用還原價為標準價格欄
     out = df[["date", "stock_id", "Trading_Volume", "Trading_money",
-              "adj_open", "adj_max", "adj_min", "adj_close"]].rename(columns={
-        "adj_open": "open", "adj_max": "high",
-        "adj_min": "low", "adj_close": "close", "Trading_Volume": "volume",
-        "Trading_money": "amount"})
+              "adj_open", "adj_max", "adj_min", "adj_close", "close"]].rename(columns={
+        "adj_open": "open", "adj_max": "high", "adj_min": "low",
+        "adj_close": "close", "close": "close_raw",
+        "Trading_Volume": "volume", "Trading_money": "amount"})
     out["ret"] = out.groupby("stock_id")["close"].pct_change()
     # 掛產業別
     g = universe[["stock_id", "group", "stock_name"]]
@@ -98,6 +103,24 @@ def prep_financials(fin):
     return wide, [f"f_{c}" for c in acc_cols]
 
 
+def prep_statement(stmt, prefix, drop_per=False):
+    """通用：long 財務報表 → wide，加可得日(法定期限)。供資產負債表/現金流量表共用。
+    drop_per：資產負債表有 *_per(占比)欄位，預設可丟掉只留原值，控制面板寬度。"""
+    df = stmt.copy()
+    df = df[df["type"].astype(str) != "-"]
+    if drop_per:
+        df = df[~df["type"].astype(str).str.endswith("_per")]
+    df["date"] = pd.to_datetime(df["date"])
+    wide = df.pivot_table(index=["stock_id", "date"], columns="type",
+                          values="value", aggfunc="first").reset_index()
+    wide.columns.name = None
+    acc = [c for c in wide.columns if c not in ("stock_id", "date")]
+    wide = wide.rename(columns={c: f"{prefix}{c}" for c in acc})
+    wide[f"{prefix}avail"] = wide["date"].apply(_stmt_deadline)
+    wide = wide.rename(columns={"date": f"{prefix}period_end"})
+    return wide.sort_values(f"{prefix}avail"), [f"{prefix}{c}" for c in acc]
+
+
 def asof_merge(base, right, right_time_col):
     """以 merge_asof(backward) 把 right 對齊到 base 的每個交易日（同 stock_id）。"""
     left = base.sort_values("date")
@@ -127,6 +150,19 @@ def main():
     fin_w, fcols = prep_financials(fin)
     base = asof_merge(base, fin_w, "fin_avail")
 
+    # 資產負債表(b_)、現金流量表(c_)：同樣用法定期限近似公告日對齊
+    bcols, ccols = [], []
+    bal = load_optional("fund_balance.parquet")
+    if bal is not None:
+        print("對齊資產負債表…")
+        bal_w, bcols = prep_statement(bal, "b_", drop_per=True)
+        base = asof_merge(base, bal_w, "b_avail")
+    cf = load_optional("fund_cashflow.parquet")
+    if cf is not None:
+        print("對齊現金流量表…")
+        cf_w, ccols = prep_statement(cf, "c_", drop_per=False)
+        base = asof_merge(base, cf_w, "c_avail")
+
     # 整理欄位順序
     base = base.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
@@ -139,9 +175,11 @@ def main():
     print(f"\n=== 對齊完成：{out} ===")
     print(f"總列數：{n:,}　股票數：{base['stock_id'].nunique()}")
     print(f"有月營收的列：{base['month_revenue'].notna().mean():.1%}")
-    fin_have = base[fcols].notna().any(axis=1).mean()
-    print(f"有財報資料的列：{fin_have:.1%}")
-    print(f"財報科目數：{len(fcols)}")
+    print(f"有損益表的列：{base[fcols].notna().any(axis=1).mean():.1%}　科目數：{len(fcols)}")
+    if bcols:
+        print(f"有資產負債表的列：{base[bcols].notna().any(axis=1).mean():.1%}　科目數：{len(bcols)}")
+    if ccols:
+        print(f"有現金流量表的列：{base[ccols].notna().any(axis=1).mean():.1%}　科目數：{len(ccols)}")
     print("\n抽查（2330 中間一段，確認財報是發布後才出現）：")
     s = base[base["stock_id"] == "2330"]
     cols = ["date", "stock_id", "close", "month_revenue",

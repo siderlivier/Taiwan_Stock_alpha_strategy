@@ -3,3 +3,4 @@ pandas
 numpy
 pyarrow
 requests
+yfinance   # 僅 fetch_benchmarks.py 抓 0050.TW(含分割/配息調整)用

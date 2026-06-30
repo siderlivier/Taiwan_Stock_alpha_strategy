@@ -22,7 +22,7 @@ import pandas as pd
 from config import DATA_PROCESSED
 from factor_eval import monthly_ic, monthly_ic_groups, summarize
 
-TRAIN_END = pd.Period("2023-12", freq="M")
+TRAIN_END = pd.Period("2019-12", freq="M")  # 訓練2012–2019、測試2020–2026(含COVID/2022空頭/2024多頭)
 GROUPS = ["半導體", "電子", "生技", "金融"]
 
 
@@ -46,47 +46,170 @@ def build_monthly_base(panel):
 
 
 def generate(m):
-    gc = m.groupby("stock_id")
+    m = m.copy()
     f = {}
 
-    # ---- 技術面 ----
+    def col(name):
+        return m[name] if name in m.columns else None
+
+    def coalesce(*names):
+        """多個同義欄位互補，解決 FinMind 科目命名隨時間改變造成的缺值。"""
+        s = None
+        for nm in names:
+            c = col(nm)
+            if c is None:
+                continue
+            s = c.copy() if s is None else s.fillna(c)
+        return s
+
+    # 淨利：跨年度命名不一致，合併多個同義欄位
+    m["_NI"] = coalesce("f_NetIncome", "f_IncomeAfterTaxes", "f_IncomeAfterTax",
+                        "f_TotalConsolidatedProfitForThePeriodAfterTax")
+    gc = m.groupby("stock_id")
+
+    def ratio(a, b):
+        if a is None or b is None:
+            return None
+        return a / b.replace(0, np.nan)
+
+    # 原始價(殖利率/市值用) vs 還原價(動能/報酬用)
+    px = m["close_raw"] if "close_raw" in m.columns else m["close"]
+
+    # ---- 技術面（還原價）----
     for k in (1, 3, 6, 12):
         f[f"mom_{k}m"] = gc["close"].pct_change(k, fill_method=None)
     f["mom_12_1"] = gc["close"].shift(1) / gc["close"].shift(12) - 1
     f["dist_high"] = m["close"] / m["hi_252"] - 1
     f["liq_amt"] = np.log(m["amt_21"] + 1)
     for v in ("vol_21", "vol_63", "vol_126"):
-        f[f"neg_{v}"] = -m[v]                     # 低波動取正向
+        f[f"neg_{v}"] = -m[v]
 
-    # ---- 基本面：殖利率/獲利率/報酬率 ----
-    price = m["close"]
-    scales = {"px": price, "rev": m.get("f_Revenue"),
-              "eq": m.get("f_EquityAttributableToOwnersOfParent"),
-              "mrev": m["month_revenue"]}
-    profits = {"gp": m.get("f_GrossProfit"), "op": m.get("f_OperatingIncome"),
-               "ni": m.get("f_NetIncome"), "pretax": m.get("f_PreTaxIncome"),
-               "eps": m.get("f_EPS")}
-    for pn, pv in profits.items():
-        if pv is None:
-            continue
-        for sn, sv in scales.items():
-            if sv is None:
-                continue
-            if pn == "eps" and sn != "px":
-                continue                          # EPS 只對股價有意義
-            name = f"{pn}_to_{sn}"
-            ratio = pv / sv.replace(0, np.nan)
-            f[name] = ratio
+    # ---- 市值/規模（原始價 × 股數；股本面額10元 → 股數 = 股本/10）----
+    cap = col("b_CapitalStock")
+    mktcap = px * (cap / 10.0) if cap is not None else None
+    if mktcap is not None:
+        f["neg_size"] = -np.log(mktcap.replace(0, np.nan))   # 小型股溢酬
+
+    # ---- 殖利率（用原始價/市值）與獲利率（對營收）----
+    rev = col("f_Revenue")
+    for pn, pv in {"gp": col("f_GrossProfit"), "op": col("f_OperatingIncome"),
+                   "ni": col("_NI"), "pretax": col("f_PreTaxIncome")}.items():
+        r = ratio(pv, px)
+        if r is not None:
+            f[f"{pn}_to_px"] = r
+        rr = ratio(pv, rev)
+        if rr is not None:
+            f[f"{pn}_to_rev"] = rr
+    eps = col("f_EPS")
+    if eps is not None:
+        f["eps_to_px"] = ratio(eps, px)
+
+    # ---- 新：資產負債表 / 現金流量表 因子（皆通用比率）----
+    ta = col("b_TotalAssets")
+    eq = col("b_Equity")
+    eqp = col("b_EquityAttributableToOwnersOfParent")
+    liab = col("b_Liabilities")
+    ca, cl = col("b_CurrentAssets"), col("b_CurrentLiabilities")
+    ni = col("_NI")
+    cfo = col("c_CashFlowsFromOperatingActivities")
+    capex = col("c_PropertyAndPlantAndEquipment")
+
+    if ni is not None and eq is not None:
+        f["roe"] = ratio(ni, eq)
+    if ni is not None and ta is not None:
+        f["roa"] = ratio(ni, ta)
+    if rev is not None and ta is not None:
+        f["asset_turnover"] = ratio(rev, ta)
+    if eqp is not None and mktcap is not None:
+        f["bp"] = ratio(eqp, mktcap)              # 淨值股價比(value)
+    if liab is not None and ta is not None:
+        f["neg_debt_ratio"] = -ratio(liab, ta)
+    if ca is not None and cl is not None:
+        f["current_ratio"] = ratio(ca, cl)
+    if cfo is not None and mktcap is not None:
+        f["cfo_yield"] = ratio(cfo, mktcap)
+    if cfo is not None and capex is not None and mktcap is not None:
+        f["fcf_yield"] = ratio(cfo - capex.abs(), mktcap)
+    if ni is not None and cfo is not None and ta is not None:
+        f["neg_accruals"] = -ratio(ni - cfo, ta)  # 低應計=高品質
+    if ta is not None:
+        f["neg_asset_growth"] = -gc["b_TotalAssets"].pct_change(12, fill_method=None)
 
     # ---- 基本面成長率 ----
     grow_fields = {"mrev": "month_revenue", "rev": "f_Revenue",
-                   "ni": "f_NetIncome", "op": "f_OperatingIncome",
+                   "ni": "_NI", "op": "f_OperatingIncome",
                    "gp": "f_GrossProfit", "eps": "f_EPS"}
-    for tag, col in grow_fields.items():
-        if col not in m.columns:
+    for tag, gcol in grow_fields.items():
+        if gcol not in m.columns:
             continue
         for k in (1, 3, 12):
-            f[f"g_{tag}_{k}"] = gc[col].pct_change(k, fill_method=None)
+            f[f"g_{tag}_{k}"] = gc[gcol].pct_change(k, fill_method=None)
+
+    # === 適度擴充因子庫 ===
+    def d12(s):
+        """每檔 12 個月變化（趨勢）。"""
+        return None if s is None else s.groupby(m["stock_id"]).diff(12)
+
+    def add(name, series, trend=False):
+        if series is None:
+            return
+        f[name] = series
+        if trend:
+            d = d12(series)
+            if d is not None:
+                f[f"d_{name}"] = d
+
+    # 利潤率與趨勢
+    gm = ratio(col("f_GrossProfit"), rev)
+    opm = ratio(col("f_OperatingIncome"), rev)
+    nm = ratio(ni, rev)
+    add("gross_margin", gm, trend=True)
+    add("op_margin", opm, trend=True)
+    add("net_margin", nm, trend=True)
+    # 報酬率趨勢
+    add("d_roe", d12(ratio(ni, eq)))
+    add("d_roa", d12(ratio(ni, ta)))
+    add("d_asset_turnover", d12(ratio(rev, ta)))
+    # 營運效率與趨勢
+    add("inv_turnover", ratio(rev, col("b_Inventories")), trend=True)
+    add("recv_turnover", ratio(rev, col("b_AccountsReceivableNet")), trend=True)
+    # 現金流品質
+    add("cfo_to_ni", ratio(cfo, ni))
+    add("capex_to_ta", ratio(capex.abs() if capex is not None else None, ta))
+    add("capex_to_rev", ratio(capex.abs() if capex is not None else None, rev))
+    if "c_CashFlowsFromOperatingActivities" in m.columns:
+        f["g_cfo_12"] = gc["c_CashFlowsFromOperatingActivities"].pct_change(12, fill_method=None)
+    # 槓桿變化
+    add("d_debt_ratio", d12(ratio(liab, ta)))
+    # 資產組成比與變化
+    for tag, c in {"cash": "b_CashAndCashEquivalents", "inv": "b_Inventories",
+                   "recv": "b_AccountsReceivableNet", "ppe": "b_PropertyPlantAndEquipment",
+                   "intang": "b_IntangibleAssets", "retain": "b_RetainedEarnings",
+                   "curr": "b_CurrentAssets"}.items():
+        add(f"{tag}_to_ta", ratio(col(c), ta), trend=True)
+    # 淨營運資金應計
+    if ca is not None and cl is not None:
+        add("d_nwc_to_ta", d12(ratio(ca - cl, ta)))
+    # 動能變體與風險調整
+    f["mom_6_1"] = gc["close"].shift(1) / gc["close"].shift(6) - 1
+    f["mom_9_1"] = gc["close"].shift(1) / gc["close"].shift(9) - 1
+    if "vol_126" in m.columns:
+        f["mom_vol_adj"] = f["mom_12_1"] / m["vol_126"].replace(0, np.nan)
+    # 營收成長加速
+    if "month_revenue" in m.columns:
+        g3 = gc["month_revenue"].pct_change(3, fill_method=None)
+        f["rev_accel"] = g3 - g3.groupby(m["stock_id"]).shift(3)
+    # Piotroski 風格品質分（部分訊號；缺值不計）
+    def sig(series, positive=True):
+        if series is None:
+            return None
+        s = (series > 0) if positive else (series < 0)
+        return s.astype(float).where(series.notna())
+    sigs = [sig(ratio(ni, ta)), sig(cfo), sig((cfo - ni) if (cfo is not None and ni is not None) else None),
+            sig(d12(ratio(ni, ta))), sig(d12(gm)), sig(d12(ratio(liab, ta)), positive=False)]
+    sigs = [s for s in sigs if s is not None]
+    if sigs:
+        f["quality_score"] = pd.concat(sigs, axis=1).sum(axis=1, min_count=1)
 
     # 組裝 + 清理 inf
     fac = pd.DataFrame(f, index=m.index)
