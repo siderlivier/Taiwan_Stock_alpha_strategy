@@ -16,3 +16,8 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 venv/
+
+# 個人文件（自己看的，不上傳 GitHub）
+面試準備_QA.md
+面試*.md
+面試*.docx
