@@ -1,8 +1,8 @@
-# 機密：絕對不要進版控
+# 機密
 .env
 *.key
 
-# 資料檔（量大、可重抓，不進版控）
+# 資料檔
 data/raw/
 data/processed/
 *.parquet
@@ -17,7 +17,5 @@ __pycache__/
 .venv/
 venv/
 
-# 個人文件（自己看的，不上傳 GitHub）
-面試準備_QA.md
-面試*.md
-面試*.docx
+# 個人文件
+個人筆記.md

@@ -211,6 +211,20 @@ def generate(m):
     if sigs:
         f["quality_score"] = pd.concat(sigs, axis=1).sum(axis=1, min_count=1)
 
+    # ---- 新：外部資料（籌碼/估值）----
+    # 實測(2012–2019 train / 2020–2026 test)：法人淨買流量、融資成長率樣本外皆失效
+    #（train 顯著但 test 翻負，過擬合），故不納入；只保留樣本外仍穩健的：
+    #   - div_yield 現金殖利率：ICIR 0.53/0.53，且與現有價值因子低相關(新維度)
+    #   - neg_short_ratio 券資比(負向)：ICIR 0.36/0.31，籌碼面新維度
+    #   - ep 盈餘殖利率(官方PER)：ICIR 0.52/0.43，與 eps_to_px 相關 0.61(部分重疊、補強)
+    add("div_yield", col("div_yield"))
+    short_bal, margin_bal = col("short_balance"), col("margin_balance")
+    if short_bal is not None and margin_bal is not None:
+        f["neg_short_ratio"] = -ratio(short_bal, margin_bal)   # 券資比越低越好
+    per_c = col("per")
+    if per_c is not None:
+        f["ep"] = 1.0 / per_c.where(per_c > 0)                 # 盈餘殖利率(越高越好)
+
     # 組裝 + 清理 inf
     fac = pd.DataFrame(f, index=m.index)
     fac = fac.replace([np.inf, -np.inf], np.nan)

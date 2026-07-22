@@ -132,6 +132,87 @@ def asof_merge(base, right, right_time_col):
     return merged
 
 
+# ---------- 擴充：日頻籌碼 / 估值（皆為收盤後公布，故一律 lag 1 日）----------
+# 可得日 = 資料日 + 1 天；asof(backward) 於交易日 T 只會取到「資料日 <= T-1」的最新值，
+# 保證不會用到當日尚未公布的籌碼（no look-ahead）。
+
+def _avail_next_day(df):
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["avail"] = df["date"] + pd.Timedelta(days=1)
+    return df
+
+
+def prep_inst(inst):
+    """個股三大法人(long) → 每日 外資/投信/自營 淨買超(股數)。"""
+    df = inst.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    for c in ("buy", "sell"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df["net"] = df["buy"] - df["sell"]
+    nm = df["name"].astype(str)
+    df["cat"] = np.select(
+        [nm.str.contains("Foreign"), nm.str.contains("Trust"), nm.str.contains("Dealer")],
+        ["foreign", "trust", "dealer"], default="other")
+    w = (df[df["cat"] != "other"]
+         .groupby(["stock_id", "date", "cat"])["net"].sum()
+         .unstack("cat").reset_index())
+    w = w.rename(columns={"foreign": "inst_foreign_net",
+                          "trust": "inst_trust_net", "dealer": "inst_dealer_net"})
+    cols = [c for c in ["inst_foreign_net", "inst_trust_net", "inst_dealer_net"]
+            if c in w.columns]
+    w[cols] = w[cols].fillna(0.0)
+    w = _avail_next_day(w)
+    return w[["stock_id", "avail"] + cols].sort_values("avail"), cols
+
+
+def prep_margin(margin):
+    """融資融券 → 每日 融資餘額 / 融券餘額（張）。"""
+    df = margin.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    keep = {"MarginPurchaseTodayBalance": "margin_balance",
+            "ShortSaleTodayBalance": "short_balance"}
+    for c in keep:
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    w = df[["stock_id", "date"] + list(keep)].rename(columns=keep)
+    cols = list(keep.values())
+    w = _avail_next_day(w)
+    return w[["stock_id", "avail"] + cols].sort_values("avail"), cols
+
+
+def prep_sharehold(sh):
+    """外資持股 → 每日 外資持股比率(%)。"""
+    df = sh.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["foreign_ratio"] = pd.to_numeric(
+        df.get("ForeignInvestmentSharesRatio"), errors="coerce")
+    w = _avail_next_day(df[["stock_id", "date", "foreign_ratio"]])
+    return w[["stock_id", "avail", "foreign_ratio"]].sort_values("avail"), ["foreign_ratio"]
+
+
+def prep_lending(lend):
+    """借券成交明細 → 每日 借券成交量(加總)。注意此資料僅 2020-09 起。"""
+    df = lend.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["volume"] = pd.to_numeric(df.get("volume"), errors="coerce").fillna(0.0)
+    w = (df.groupby(["stock_id", "date"])["volume"].sum().reset_index()
+           .rename(columns={"volume": "lending_vol"}))
+    w = _avail_next_day(w)
+    return w[["stock_id", "avail", "lending_vol"]].sort_values("avail"), ["lending_vol"]
+
+
+def prep_per(per):
+    """PER / PBR / 殖利率 → 每日。"""
+    df = per.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    ren = {"PER": "per", "PBR": "pbr", "dividend_yield": "div_yield"}
+    for c in ren:
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    w = _avail_next_day(df[["stock_id", "date"] + list(ren)].rename(columns=ren))
+    cols = list(ren.values())
+    return w[["stock_id", "avail"] + cols].sort_values("avail"), cols
+
+
 def main():
     prices = load("prices.parquet")
     rev = load("fund_revenue.parquet")
@@ -163,6 +244,26 @@ def main():
         cf_w, ccols = prep_statement(cf, "c_", drop_per=False)
         base = asof_merge(base, cf_w, "c_avail")
 
+    # ---- 擴充：日頻籌碼 / 估值（皆 lag 1 日，asof backward）----
+    chip_specs = [("chip_inst.parquet", prep_inst),
+                  ("chip_margin.parquet", prep_margin),
+                  ("chip_sharehold.parquet", prep_sharehold),
+                  ("chip_lending.parquet", prep_lending),
+                  ("chip_per.parquet", prep_per)]
+    chip_cols = []
+    for i, (fname, fn) in enumerate(chip_specs):
+        raw = load_optional(fname)
+        if raw is None or raw.empty:
+            print(f"（略過 {fname}：未下載）")
+            continue
+        print(f"對齊 {fname}（lag 1 日）…")
+        right, cols = fn(raw)
+        tcol = f"_chip_avail_{i}"
+        right = right.rename(columns={"avail": tcol})
+        base = asof_merge(base, right, tcol)
+        base = base.drop(columns=[tcol])
+        chip_cols += cols
+
     # 整理欄位順序
     base = base.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
@@ -180,6 +281,9 @@ def main():
         print(f"有資產負債表的列：{base[bcols].notna().any(axis=1).mean():.1%}　科目數：{len(bcols)}")
     if ccols:
         print(f"有現金流量表的列：{base[ccols].notna().any(axis=1).mean():.1%}　科目數：{len(ccols)}")
+    for c in chip_cols:
+        if c in base.columns:
+            print(f"有 {c} 的列：{base[c].notna().mean():.1%}")
     print("\n抽查（2330 中間一段，確認財報是發布後才出現）：")
     s = base[base["stock_id"] == "2330"]
     cols = ["date", "stock_id", "close", "month_revenue",

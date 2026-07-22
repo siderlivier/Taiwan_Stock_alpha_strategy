@@ -7,3 +7,4 @@ yfinance   # 僅 fetch_benchmarks.py 抓 0050.TW(含分割/配息調整)用
 lightgbm       # ml_model.py：GBDT 因子合成模型
 scikit-learn   # ml_model.py：Ridge 線性對照
 shap           # ml_model.py：特徵貢獻解釋(可選)
+scipy          # ml_validation.py：DSR/PBO 用常態分佈
