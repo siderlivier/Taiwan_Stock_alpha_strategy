@@ -45,6 +45,36 @@ def build_monthly_base(panel):
     return m.sort_values(["stock_id", "ym"]).reset_index(drop=True)
 
 
+def _assert_no_duplicate_factors(fac: pd.DataFrame) -> None:
+    """
+    防呆：擋住「同一條公式掛兩個名字」。
+
+    這不是假想的風險——實際發生過三次。generate() 有兩個區塊會算獲利率，
+    後加的那個沒有回頭檢查前面算過了，於是 gross_margin/gp_to_rev、
+    op_margin/op_to_rev、net_margin/ni_to_rev 三對完全重複地並存。
+    逐因子的評估（IC、ICIR、t 值）**完全看不出來**，因為每一個單獨看都正常；
+    要到下游做因子合成時才會發現某個概念被賦予了兩倍權重。
+
+    用整欄的雜湊比對，O(欄數)，比兩兩相關快得多，而且抓的是「完全相同」
+    這個明確的定義，不需要調門檻。
+    """
+    import hashlib
+    sig, dups = {}, []
+    for c in fac.columns:
+        v = fac[c].to_numpy(dtype="float64", na_value=np.nan, copy=False)
+        h = hashlib.md5(np.ascontiguousarray(v).tobytes()).hexdigest()
+        if h in sig:
+            dups.append((c, sig[h]))
+        else:
+            sig[h] = c
+    if dups:
+        lines = "\n".join(f"    {a} 與 {b} 的值完全相同" for a, b in dups)
+        raise ValueError(
+            f"generate() 產生了 {len(dups)} 對重複因子：\n{lines}\n"
+            f"→ 通常是某個因子在兩個區塊各算了一次。留一個就好，"
+            f"但注意 trend=True 產生的 d_* 衍生因子不是重複的。")
+
+
 def generate(m):
     m = m.copy()
     f = {}
@@ -159,13 +189,23 @@ def generate(m):
             if d is not None:
                 f[f"d_{name}"] = d
 
-    # 利潤率與趨勢
+    # 利潤率的「趨勢」。
+    # ⚠️ 這裡刻意只加 d_* 衍生因子，不再重複加水準值本身。
+    #    gross_margin / op_margin / net_margin 與上面那個
+    #    「獲利對營收」迴圈產生的 gp_to_rev / op_to_rev / ni_to_rev
+    #    是**完全相同的公式**（ρ = 1.000，連 ICIR 都逐位相同）。
+    #    早期版本兩邊都收，造成 3 對重複因子：因子數灌水，
+    #    而且 ml_model.py 的等權 baseline 會把「淨利率」算兩次。
+    #    d_gross_margin / d_op_margin / d_net_margin 是 12 期變化，
+    #    上面的迴圈沒有算，不是重複的，必須保留。
     gm = ratio(col("f_GrossProfit"), rev)
     opm = ratio(col("f_OperatingIncome"), rev)
     nm = ratio(ni, rev)
-    add("gross_margin", gm, trend=True)
-    add("op_margin", opm, trend=True)
-    add("net_margin", nm, trend=True)
+    for _nm, _sr in (("gross_margin", gm), ("op_margin", opm),
+                     ("net_margin", nm)):
+        _d = d12(_sr)
+        if _d is not None:
+            f[f"d_{_nm}"] = _d
     # 報酬率趨勢
     add("d_roe", d12(ratio(ni, eq)))
     add("d_roa", d12(ratio(ni, ta)))
@@ -228,6 +268,7 @@ def generate(m):
     # 組裝 + 清理 inf
     fac = pd.DataFrame(f, index=m.index)
     fac = fac.replace([np.inf, -np.inf], np.nan)
+    _assert_no_duplicate_factors(fac)
     names = list(fac.columns)
     out = pd.concat([m[["stock_id", "group", "ym", "date", "close"]], fac], axis=1)
 
